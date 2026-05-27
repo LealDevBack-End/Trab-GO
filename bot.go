@@ -9,6 +9,41 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+func resolveBotToken() string {
+	for _, key := range []string{"token", "TOKEN", "BOT_TOKEN", "TELEGRAM_BOT_TOKEN"} {
+		if v, ok := os.LookupEnv(key); ok {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				return v
+			}
+		}
+	}
+
+	// Fallback simples: .env no diretório atual, formato KEY=VALUE.
+	// (Sem dependências externas; ignora linhas vazias e comentários.)
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		v = strings.Trim(v, `"'`)
+		if k == "TOKEN" && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func main() {
 	token := resolveBotToken()
 	if token == "" {
