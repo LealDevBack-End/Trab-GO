@@ -1,13 +1,155 @@
 package main
 
 import (
+	"database/sql"
+	"fmt"
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"unicode"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	_ "github.com/go-sql-driver/mysql"
 )
+
+var (
+	dbDotEnvOnce   sync.Once
+	dbDotEnvValues map[string]string
+)
+
+func loadDotEnvValues() {
+	dbDotEnvValues = map[string]string{}
+
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		return
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		v = strings.Trim(v, `"'`)
+
+		if k != "" && v != "" {
+			dbDotEnvValues[k] = v
+		}
+	}
+}
+
+func getEnvOrDotEnv(key string) (string, bool) {
+	if v, ok := os.LookupEnv(key); ok {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			return v, true
+		}
+	}
+
+	dbDotEnvOnce.Do(loadDotEnvValues)
+	if v, ok := dbDotEnvValues[key]; ok {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func resolveDBConfig() (dsn string, missing []string) {
+	required := []string{"DB_HOST", "DB_USER", "DB_PASS", "DB_NAME"}
+	for _, k := range required {
+		if _, ok := getEnvOrDotEnv(k); !ok {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return "", missing
+	}
+
+	host, _ := getEnvOrDotEnv("DB_HOST")
+	port := "3306"
+	if v, ok := getEnvOrDotEnv("DB_PORT"); ok && strings.TrimSpace(v) != "" {
+		port = strings.TrimSpace(v)
+	}
+	user, _ := getEnvOrDotEnv("DB_USER")
+	pass, _ := getEnvOrDotEnv("DB_PASS")
+	name, _ := getEnvOrDotEnv("DB_NAME")
+
+	// charset/parseTime ajudam no dia-a-dia.
+	dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=Local", user, pass, host, port, name)
+	return dsn, nil
+}
+
+func ensureSchema(db *sql.DB) error {
+	const ddl = `
+CREATE TABLE IF NOT EXISTS cpf_validations (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  cpf CHAR(11) NOT NULL,
+  is_valid TINYINT(1) NOT NULL,
+  raw_text VARCHAR(255) NOT NULL,
+  telegram_chat_id BIGINT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  INDEX idx_cpf (cpf),
+  INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+`
+	_, err := db.Exec(ddl)
+	return err
+}
+
+func openMySQL() (*sql.DB, error) {
+	dsn, missing := resolveDBConfig()
+	if dsn == "" {
+		return nil, fmt.Errorf("config DB incompleta. Defina no .env/variaveis de ambiente: %s", strings.Join(missing, ", "))
+	}
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := ensureSchema(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func saveCPFValidation(db *sql.DB, chatID int64, cpfDigits string, isValid bool, rawText string) {
+	if db == nil {
+		return
+	}
+	rawText = strings.TrimSpace(rawText)
+	if len(rawText) > 255 {
+		rawText = rawText[:255]
+	}
+
+	isValidInt := 0
+	if isValid {
+		isValidInt = 1
+	}
+
+	_, err := db.Exec(
+		`INSERT INTO cpf_validations (cpf, is_valid, raw_text, telegram_chat_id) VALUES (?, ?, ?, ?)`,
+		cpfDigits, isValidInt, rawText, chatID,
+	)
+	if err != nil {
+		log.Printf("erro ao salvar validacao CPF: %v", err)
+	}
+}
 
 func resolveBotToken() string {
 	for _, key := range []string{"token", "TOKEN", "BOT_TOKEN", "TELEGRAM_BOT_TOKEN"} {
@@ -15,6 +157,10 @@ func resolveBotToken() string {
 			v = strings.TrimSpace(v)
 			if v != "" {
 				return v
+
+
+
+
 			}
 		}
 	}
@@ -50,6 +196,16 @@ func main() {
 		log.Fatal("token do bot nao encontrado.\nDefina uma variavel de ambiente (token/TOKEN/BOT_TOKEN/TELEGRAM_BOT_TOKEN) ou crie um arquivo .env com TOKEN=SEU_TOKEN.\nPowerShell:\n  $env:token=\"SEU_TOKEN\"; go run .\nCMD:\n  set token=SEU_TOKEN && go run .")
 	}
 
+	db, err := openMySQL()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+
 	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		log.Fatalf("erro ao criar bot: %v", err)
@@ -83,6 +239,26 @@ func main() {
 		if text == "" {
 			continue
 		}
+
+		// Se tiver 11 digitos na mensagem, tratamos como CPF (mesmo que venha junto com "/validar ...").
+		cpfDigits := onlyDigits(text)
+		if len(cpfDigits) == 11 {
+			valid := isCPF(text)
+			if valid {
+				saveCPFValidation(db, update.Message.Chat.ID, cpfDigits, true, text)
+				sendReply(bot, update.Message.Chat.ID, "✅ CPF <b>valido</b>.", buildMainMenu())
+			} else {
+				saveCPFValidation(db, update.Message.Chat.ID, cpfDigits, false, text)
+				sendReply(
+					bot,
+					update.Message.Chat.ID,
+					"❌ CPF <b>invalido</b>.\nToque em <b>✅ Validar CPF</b> no menu e tente novamente.\n\n"+fallbackMenuText(),
+					buildMainMenu(),
+				)
+			}
+			continue
+		}
+
 		cmd := commandName(update.Message)
 		log.Printf("mensagem recebida chat_id=%d texto=%q cmd=%q", update.Message.Chat.ID, text, cmd)
 
@@ -99,8 +275,6 @@ func main() {
 		case isAboutRequest(text) || cmd == "sobre":
 			response = "📘 Sobre este bot\nEscolha uma opcao abaixo:\n\n" + fallbackMenuText()
 			markup = buildInlineMenu()
-		case isCPF(text):
-			response = "✅ CPF <b>valido</b>."
 		default:
 			response = "❌ CPF <b>invalido</b>.\nToque em <b>✅ Validar CPF</b> no menu e tente novamente.\n\n" + fallbackMenuText()
 		}
